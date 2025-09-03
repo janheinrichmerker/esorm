@@ -1378,7 +1378,7 @@ async def setup_mappings(*_, debug=False):
             index_exists = True
         except (elasticsearch.NotFoundError, KeyError):
             properties = {}
-        properties.merge(create_mapping(model, properties))
+        properties.update(create_mapping(model, properties))
 
         if debug:
             from pprint import pformat
