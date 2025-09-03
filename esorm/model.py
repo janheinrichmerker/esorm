@@ -2,9 +2,9 @@
 This module contains the ESModel classes and related functions
 """
 from typing import (TypeVar, Any, Dict, Optional, Tuple, Type, Union, get_args, get_origin, List, Callable,
-                    Awaitable, Literal, cast)
+                    Awaitable, Literal, cast, Sequence, Mapping)
 from typing_extensions import TypedDict, Annotated
-from enum import Enum, IntEnum
+from enum import Enum, IntEnum, StrEnum
 
 import asyncio
 import ast
@@ -24,7 +24,7 @@ from pydantic.fields import Field, PrivateAttr
 from pydantic.fields import FieldInfo  # It is just not in __all__ of pydantic.fields, but we strongly need it
 from pydantic_core import Url
 from pydantic.networks import IPvAnyAddress
-from pydantic import AnyUrl
+from pydantic import AnyUrl, EmailStr
 
 from uuid import UUID
 from pathlib import Path
@@ -1201,170 +1201,167 @@ async def create_index_template(name: str,
         )
 
 
+_elasticsearch_types: Mapping[type[Any] | Any, str] = {
+    # Pydantic types
+    Url: "keyword",
+    AnyUrl: "keyword",
+    EmailStr: "keyword",
+    IPvAnyAddress: "ip",
+    # Python enum types
+    IntEnum: "integer",
+    StrEnum: "keyword",
+    Enum: "keyword",
+    # Python date types
+    datetime: "date",
+    date: "date",
+    time: "date",
+    # Other python types
+    UUID: "keyword",
+    Path: "keyword",
+    # Python primitive types
+    bool: "boolean",
+    int: "long",
+    float: "double",
+    str: "keyword",
+    # bytes: "binary",  # TODO
+    # bytearray: "binary",  # TODO
+}
+
+
+def get_field_data(field_info: FieldInfo) -> dict[str, Any]:
+    """
+    Determine Elasticsearch field data type from Pydantic field.
+    """
+
+    print(field_info)
+
+    # Get extra field info.
+    json_schema_extra = field_info.json_schema_extra
+    extra: dict[str, Any]
+    if callable(json_schema_extra):
+        extra = {}
+        json_schema_extra(extra)
+    elif json_schema_extra is not None:
+        extra = json_schema_extra
+    else:
+        extra = {}
+
+    # Get field type annotation.
+    annotation = field_info.annotation
+
+    # Cannot determine Elasticsearch type.
+    if annotation is None:
+        raise ValueError(
+            "Missing type annotation to determine Elasticsearch field type."
+        )
+
+    # Manually overwritten Elasticsearch type.
+    if hasattr(annotation, "__es_type__"):
+        return {"type": getattr(annotation, "__es_type__"), **extra}
+
+    origin = get_origin(annotation)
+    args: Sequence[Type[Any]] = get_args(annotation)
+
+    # Handle `Literals` as keywords.
+    if origin is Literal:
+        return {"type": "keyword", **extra}
+
+    # Handle `Optional` type by unwrapping it.
+    if origin is Optional:
+        if len(args) == 1:
+            return {
+                **get_field_data(FieldInfo.from_annotation(args[0])),
+                **extra,
+            }
+        raise ValueError(f"Expected a single argument for Optional, got {len(args)}.")
+
+    # Handle `Annotated` type by unwrapping it.
+    if origin is Annotated:
+        if len(args) >= 2:
+            return {
+                **get_field_data(FieldInfo.from_annotation(args[0])),
+                **extra,
+            }
+        raise ValueError(
+            f"Expected at least two arguments for Annotated, got {len(args)}."
+        )
+
+    # Handle `Union` type by unwrapping it. (Legacy support for `esorm.fields` types.)
+    if origin is Union:
+        # Remove `None`'s from the `Union`.
+        args = [arg for arg in args if arg is not type(None)]
+
+        # Unwrap the trivial one-member `Union`.
+        if len(args) == 1:
+            return {
+                **get_field_data(FieldInfo.from_annotation(args[0])),
+                **extra,
+            }
+
+        # Legacy support for `Union` with two members.
+        if len(args) == 2:
+            return {
+                **get_field_data(FieldInfo.from_annotation(args[0])),
+                **extra,
+            }
+
+        raise ValueError("Union is not supported as Elasticsearch field type.")
+
+    # Nested model class.
+    if BaseModel in annotation.mro():
+        sub_properties = create_mapping(annotation)
+        return {"type": "object", **sub_properties, **extra}
+
+    # Look up Elasticsearch type from dictionary.
+    for cls, es_type in _elasticsearch_types.items():
+        if cls in annotation.mro():
+            return {"type": es_type, **extra}
+
+    # Sequence types (e.g., list)
+    if origin is not None and issubclass(origin, Sequence):
+        if len(args) != 1:
+            raise ValueError(
+                f"Expected a single argument for Sequence, got {len(args)}."
+            )
+        nested_field_data = {
+            **get_field_data(FieldInfo.from_annotation(args[0])),
+            **extra,
+        }
+
+        # The nested type was itself a model class.
+        if nested_field_data.get("type") == "object":
+            nested_field_data.update({"type": "nested"})
+
+        return nested_field_data
+
+    raise ValueError(f"Could not determine Elasticsearch field type for: {annotation}")
+
+
+def create_mapping(model: Type[BaseModel]) -> dict[str, Any]:
+    """Creates mapping for the model"""
+    id_field: str | None = None
+    if hasattr(model, "ESConfig") and hasattr(getattr(model, "ESConfig"), "id_field"):
+        id_field = getattr(getattr(model, "ESConfig"), "id_field")
+    properties: dict[str, Any] = {}
+    for name, field_info in model.model_fields.items():
+        # Skip ID field, because it is not stored in the mapping.
+        if id_field == name:
+            continue
+
+        # Alias support.
+        if field_info.alias:
+            name = field_info.alias
+
+        # Process field.
+        properties[name] = get_field_data(field_info)
+
+    return {"properties": properties}
+
+
 async def setup_mappings(*_, debug=False):
     """
     Create mappings for indices or try to extend it if there are new fields
     """
-
-    # noinspection PyShadowingNames
-    def get_field_data(pydantic_type: type) -> dict:
-        """ Get field data from pydantic type """
-        origin = get_origin(pydantic_type)
-        args = get_args(pydantic_type)
-
-        # Handle Union type, which must be a type definition from esorm.fields, because other unions not allowed
-        if origin and (
-                origin is Union
-                or
-                getattr(origin, '__name__', None) == 'UnionType'  # UnionType is in newer Pythons, this works backwards
-        ):
-            # Optional may equal to Union[..., None], we don't use Optional in ES, but its child
-            if type(None) in args:
-                return get_field_data(args[0])
-
-            for arg in args:
-                if hasattr(arg, '__es_type__'):
-                    result = {'type': arg.__es_type__}
-
-                    # Handle dense_vector specific parameters
-                    if arg.__es_type__ == 'dense_vector':
-                        field_info = next((f for f in model.model_fields.values()
-                                           if f.annotation == pydantic_type), None)
-                        if field_info and field_info.json_schema_extra:
-                            extra = field_info.json_schema_extra
-                            if 'dims' in extra:
-                                result['dims'] = extra['dims']
-                            if 'similarity' in extra:
-                                result['similarity'] = extra['similarity']
-
-                    return result
-
-            raise ValueError('Union is not supported as ES field type!')
-
-        # We don't use Optional in ES, but its child
-        if origin is Optional:
-            return get_field_data(args[0])
-
-        # List types
-        if origin is list:
-            arg = args[0]
-
-            # Python type
-            try:
-                return {'type': _pydantic_type_map[arg]}
-            except KeyError:
-                pass
-
-            # ESORM type
-            if hasattr(arg, '__es_type__'):
-                return {'type': arg.__es_type__}
-            else:
-                sub_origin = get_origin(arg)
-                if sub_origin is Union:
-                    try:
-                        sub_arg = get_args(arg)[0]
-                        return {'type': sub_arg.__es_type__}
-                    except IndexError:
-                        pass
-                    raise ValueError(f'Unsupported ES field type: {arg}')
-
-            # Nested class
-            properties = {}
-            create_mapping(arg, properties)
-            return {
-                'type': 'nested',
-                'properties': properties
-            }
-
-        # String literals
-        if origin is Literal:
-            return {'type': 'keyword'}
-
-        # Pydantic annotated types (e.g. HttpUrl in <v2.10.0)
-        if origin is Annotated:
-            return get_field_data(args[0])
-
-        # Origin could be a base type as well in older Python versions
-        if origin in [int, float, str, bool]:
-            return {'type': _pydantic_type_map[origin]}
-
-        # Not supported origin type
-        if origin:
-            raise ValueError(f'Unsupported ES field type: {pydantic_type}, origin: {origin}')
-
-        # Nested class
-        if issubclass(pydantic_type, BaseModel):
-            # If it is a model but has an es_type, use it (e.g. geo_point)
-            if hasattr(pydantic_type, '__es_type__'):
-                return {'type': pydantic_type.__es_type__}
-
-            properties = {}
-            create_mapping(pydantic_type, properties)
-            return {'properties': properties}
-
-        # IntEnum type as integer
-        if issubclass(pydantic_type, IntEnum):
-            return {'type': 'integer'}
-
-        # Other Enum types as keyword
-        if issubclass(pydantic_type, Enum):
-            return {'type': 'keyword'}
-
-        # Is it an ESORM type?
-        if hasattr(pydantic_type, '__es_type__'):
-            result = {'type': pydantic_type.__es_type__}
-
-            # Handle dense_vector specific parameters
-            if pydantic_type.__es_type__ == 'dense_vector':
-                field_info = next((f for f in model.model_fields.values()
-                                   if f.annotation == pydantic_type), None)
-                if field_info and field_info.json_schema_extra:
-                    extra = field_info.json_schema_extra
-                    if 'dims' in extra:
-                        result['dims'] = extra['dims']
-                    if 'similarity' in extra:
-                        result['similarity'] = extra['similarity']
-
-            return result
-
-        if issubclass(pydantic_type, AnyUrl):
-            return {'type': 'keyword'}
-
-        # Python type
-        try:
-            # noinspection PyTypeChecker
-            return {'type': _pydantic_type_map[pydantic_type]}
-        except KeyError:
-            pass
-
-        raise ValueError(f'Unknown ES field type: {pydantic_type} (origin: {origin}, args: {args})')
-
-    # noinspection PyShadowingNames
-    def create_mapping(model: Type[BaseModel], properties: dict):
-        """ Creates mapping for the model """
-        field_info: FieldInfo
-        for name, field_info in model.model_fields.items():
-            # Skip id field, because it won't be stored
-            if hasattr(model, 'ESConfig') and model.ESConfig.id_field == name:
-                continue
-            # Alias support
-            if field_info.alias:
-                name = field_info.alias
-            # Get extra field info
-            extra = field_info.json_schema_extra or {}
-            # Process field
-            res = get_field_data(field_info.annotation)
-            _type = res.get('type', None)
-            if 'index' in extra and _type != 'binary':
-                if 'properties' in res:
-                    for v in res['properties'].values():
-                        v['index'] = extra['index']
-                else:
-                    res['index'] = extra['index']
-            # Add subfields if specified
-            if 'fields' in extra:
-                res['fields'] = extra['fields']
-            properties[name] = res
 
     # Process all models and create mappings
     for index, model in _ESModelMeta.__models__.items():
@@ -1381,7 +1378,7 @@ async def setup_mappings(*_, debug=False):
             index_exists = True
         except (elasticsearch.NotFoundError, KeyError):
             properties = {}
-        create_mapping(model, properties)
+        properties.merge(create_mapping(model, properties))
 
         if debug:
             from pprint import pformat
